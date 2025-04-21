@@ -10,17 +10,25 @@ app = FastAPI(
 )
 
 # CORS 설정
+origins = [
+    "http://localhost:3000",  # React 개발 서버
+    "http://127.0.0.1:3000",  # React 개발 서버 (대체 주소)
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # React 클라이언트 주소
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 # API 라우터 등록
 app.include_router(audio.router, prefix=settings.API_V1_STR + "/audio", tags=["audio"])
-app.include_router(websocket.router, prefix=settings.API_V1_STR, tags=["websocket"])
+
+# Socket.IO 애플리케이션 등록
+app.mount("/socket.io", websocket.socket_app)
 
 @app.get("/")
 async def root():

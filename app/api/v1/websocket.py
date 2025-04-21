@@ -1,57 +1,101 @@
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+import socketio
 import numpy as np
-import io
-import soundfile as sf
-import asyncio
-from typing import List
 import json
-from app.services.speech_analysis import speech_analyzer
+from app.services.pronunciation_analyzer import pronunciation_analyzer
+import logging
 
-router = APIRouter()
+# 로깅 설정
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
+# Socket.IO 서버 생성
+sio = socketio.AsyncServer(
+    async_mode='asgi',
+    cors_allowed_origins=['http://localhost:3000'],
+    logger=True,
+    engineio_logger=True,
+    ping_timeout=60,
+    ping_interval=25
+)
+
+# 연결 관리
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: List[WebSocket] = []
+        self.reference_texts = {}
+        self.audio_buffers = {}
+        self.buffer_size = 5
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    def set_reference_text(self, sid, text):
+        self.reference_texts[sid] = text
+        logger.info(f"참조 텍스트 설정: {text}")
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+    def add_audio_chunk(self, sid, audio_data):
+        if sid not in self.audio_buffers:
+            self.audio_buffers[sid] = []
+        self.audio_buffers[sid].append(audio_data)
+        if len(self.audio_buffers[sid]) > self.buffer_size:
+            self.audio_buffers[sid].pop(0)
 
-    async def send_personal_message(self, message: str, websocket: WebSocket):
-        await websocket.send_text(message)
-
-    async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            await connection.send_text(message)
+    def get_audio_buffer(self, sid):
+        if sid in self.audio_buffers and self.audio_buffers[sid]:
+            return np.concatenate(self.audio_buffers[sid])
+        return np.array([])
 
 manager = ConnectionManager()
 
-@router.websocket("/ws/audio")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+# Socket.IO 이벤트 핸들러
+@sio.event
+async def connect(sid, environ):
+    logger.info(f"새로운 클라이언트 연결: {sid}")
+    await sio.emit('connect_response', {'status': 'connected'}, room=sid)
+
+@sio.event
+async def disconnect(sid):
+    logger.info(f"클라이언트 연결 종료: {sid}")
+    if sid in manager.reference_texts:
+        del manager.reference_texts[sid]
+    if sid in manager.audio_buffers:
+        del manager.audio_buffers[sid]
+
+@sio.event
+async def reference(sid, data):
     try:
-        while True:
-            # 오디오 데이터 수신
-            data = await websocket.receive_bytes()
-            
-            # 바이트 데이터를 numpy 배열로 변환
-            audio_data = np.frombuffer(data, dtype=np.float32)
-            
-            # 음성 분석 수행
-            analysis_result = await speech_analyzer.analyze_speech(audio_data)
-            
-            # 분석 결과를 JSON 문자열로 변환하여 전송
-            await manager.send_personal_message(json.dumps(analysis_result), websocket)
-            
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        await manager.broadcast(f"Client disconnected")
+        text = data.get('text')
+        if text:
+            manager.set_reference_text(sid, text)
+            await sio.emit('reference_response', {
+                'status': 'success',
+                'message': '참조 텍스트 설정 완료',
+                'text': text
+            }, room=sid)
     except Exception as e:
-        error_message = json.dumps({
-            "status": "error",
-            "message": str(e)
-        })
-        await manager.send_personal_message(error_message, websocket) 
+        logger.error(f"참조 텍스트 설정 중 오류: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+@sio.event
+async def audio(sid, data):
+    try:
+        audio_data = np.array(data.get('data'), dtype=np.float32)
+        manager.add_audio_chunk(sid, audio_data)
+        
+        if len(manager.audio_buffers.get(sid, [])) >= manager.buffer_size:
+            reference_text = manager.reference_texts.get(sid)
+            if reference_text is None:
+                await sio.emit('error', {
+                    'message': '참조 텍스트가 설정되지 않았습니다'
+                }, room=sid)
+                return
+            
+            audio_buffer = manager.get_audio_buffer(sid)
+            analysis_result = pronunciation_analyzer.analyze_pronunciation(
+                audio_buffer,
+                reference_text
+            )
+            
+            await sio.emit('analysis_result', analysis_result, room=sid)
+    except Exception as e:
+        logger.error(f"오디오 처리 중 오류: {e}")
+        await sio.emit('error', {'message': str(e)}, room=sid)
+
+# Socket.IO 애플리케이션 생성
+socket_app = socketio.ASGIApp(sio) 
