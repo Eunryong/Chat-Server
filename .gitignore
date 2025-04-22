@@ -22,9 +22,12 @@ wheels/
 
 # Virtual Environment
 venv/
-ENV/
 env/
+ENV/
 .env
+.venv
+env.bak/
+venv.bak/
 
 # IDE
 .idea/
@@ -36,6 +39,26 @@ env/
 # Logs
 *.log
 logs/
+stt_server.log
+
+# Model files
+*.pt
+*.pth
+*.bin
+*.onnx
+
+# Database
+*.db
+*.sqlite3
+
+# Cache
+.cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter Notebook
+.ipynb_checkpoints
 
 # Local development
 .env.local
@@ -43,31 +66,7 @@ logs/
 .env.test.local
 .env.production.local
 
-# Model checkpoints and data
-*.pth
-*.pt
-*.ckpt
-*.h5
-*.hdf5
-data/
-models/
-
-# Jupyter Notebook
-.ipynb_checkpoints
-*.ipynb
-
-# Coverage reports
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-
-# Unit test / coverage reports
-.pytest_cache/
-.coverage
-htmlcov/ 
+# Temporary files
+*.tmp
+*.temp
+*.bak 

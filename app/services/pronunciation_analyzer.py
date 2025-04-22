@@ -7,6 +7,10 @@ from typing import Dict, List, Tuple, Any
 import re
 from dataclasses import dataclass
 from enum import Enum
+import logging
+from collections import deque
+
+logger = logging.getLogger(__name__)
 
 class PhonemeType(Enum):
     CONSONANT = "consonant"
@@ -28,9 +32,19 @@ class PronunciationAnalyzer:
         self.processor = Wav2Vec2Processor.from_pretrained(self.model_name)
         self.model = Wav2Vec2ForCTC.from_pretrained(self.model_name)
         
-        # GPU 사용 가능시 GPU로 이동
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # CPU 사용
+        self.device = torch.device("cpu")
         self.model.to(self.device)
+        
+        # 오디오 전처리 설정
+        self.sample_rate = 16000
+        self.window_size = 2048
+        self.hop_length = 512
+        self.min_volume = 0.1
+        
+        # 버퍼 설정
+        self.buffer_size = 5  # 버퍼 크기 (초)
+        self.audio_buffer = deque(maxlen=self.buffer_size * self.sample_rate)
         
         # 한국어 음소 매핑
         self.jamo_map = {
@@ -53,26 +67,64 @@ class PronunciationAnalyzer:
             # ... 다른 음소에 대한 규칙 추가
         }
     
-    def analyze_pronunciation(self, audio_data: np.ndarray, reference_text: str) -> Dict[str, Any]:
-        """
-        오디오 데이터의 발음을 분석하여 정확도를 평가
-        
-        Args:
-            audio_data: numpy 배열 형태의 오디오 데이터
-            reference_text: 참조 텍스트 (정확한 발음)
-            
-        Returns:
-            발음 분석 결과
-        """
+    def preprocess_audio(self, audio_data: np.ndarray) -> np.ndarray:
+        """오디오 데이터 전처리"""
         try:
+            logger.info(f"전처리 전 오디오 데이터: 최소={np.min(audio_data)}, 최대={np.max(audio_data)}")
+            
+            # 볼륨 정규화
+            max_volume = np.max(np.abs(audio_data))
+            if max_volume > 0:
+                audio_data = audio_data / max_volume
+            
+            # 노이즈 제거
+            audio_data = librosa.effects.preemphasis(audio_data)
+            
+            # 샘플링 레이트 확인 및 조정
+            if len(audio_data) < self.sample_rate:
+                # 데이터가 너무 짧으면 패딩 추가
+                padding = np.zeros(self.sample_rate - len(audio_data))
+                audio_data = np.concatenate([audio_data, padding])
+            elif len(audio_data) > self.sample_rate * 30:  # 30초 이상이면 잘라냄
+                audio_data = audio_data[:self.sample_rate * 30]
+            
+            logger.info(f"전처리 후 오디오 데이터: 최소={np.min(audio_data)}, 최대={np.max(audio_data)}")
+            return audio_data
+            
+        except Exception as e:
+            logger.error(f"[오디오 전처리 오류] {str(e)}")
+            return audio_data
+
+    def analyze_pronunciation(self, audio_data: np.ndarray, reference_text: str) -> Dict[str, Any]:
+        """오디오 데이터의 발음을 분석하여 정확도를 평가"""
+        try:
+            logger.info(f"입력 오디오 데이터 크기: {len(audio_data)}")
+            
+            # 오디오 전처리
+            audio_data = self.preprocess_audio(audio_data)
+            logger.info(f"전처리 후 오디오 데이터 크기: {len(audio_data)}")
+            
             # 음성 인식
-            input_values = self.processor(audio_data, sampling_rate=16000, return_tensors="pt").input_values
+            input_values = self.processor(
+                audio_data, 
+                sampling_rate=self.sample_rate,
+                return_tensors="pt",
+                padding=True
+            ).input_values
+            
+            logger.info(f"모델 입력 텐서 크기: {input_values.shape}")
+            
             input_values = input_values.to(self.device)
             
             with torch.no_grad():
                 logits = self.model(input_values).logits
+                logger.info(f"모델 출력 로짓 크기: {logits.shape}")
+                
                 predicted_ids = torch.argmax(logits, dim=-1)
+                logger.info(f"예측된 ID: {predicted_ids}")
+                
                 transcription = self.processor.batch_decode(predicted_ids)[0]
+                logger.info(f"인식된 텍스트: {transcription}")
             
             # 음소 단위로 분리
             reference_jamo = self._text_to_jamo(reference_text)
@@ -103,9 +155,11 @@ class PronunciationAnalyzer:
             }
             
         except Exception as e:
+            logger.error(f"[발음 분석 오류] {str(e)}")
             return {
                 "error": str(e),
-                "overall_score": 0.0
+                "overall_score": 0.0,
+                "transcription": ""
             }
     
     def _text_to_jamo(self, text: str) -> List[str]:
