@@ -69,4 +69,19 @@ htmlcov/
 # Temporary files
 *.tmp
 *.temp
-*.bak 
+*.bak
+
+# Audio files
+*.wav
+*.mp3
+*.ogg
+*.m4a
+
+# System files
+Thumbs.db
+.DS_Store
+*.pid
+*.seed
+*.pid.lock 
+
+model_cache/

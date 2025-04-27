@@ -1,3 +1,71 @@
+import uvicorn
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+import socketio
+import logging
+
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('stt_server.log')
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# FastAPI 애플리케이션 생성
+app = FastAPI()
+
+# CORS 미들웨어 추가
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"]
+)
+
+# Socket.IO 서버 생성
+sio = socketio.AsyncServer(
+    async_mode='asgi',
+    cors_allowed_origins=['*'],
+    logger=True,
+    engineio_logger=True,
+    ping_timeout=60,
+    ping_interval=25,
+    allow_upgrades=True,
+    transports=['websocket', 'polling'],
+    max_http_buffer_size=1e8,
+    async_handlers=True,
+    always_connect=True,
+    reconnection=True,
+    reconnection_attempts=5,
+    reconnection_delay=1000,
+    reconnection_delay_max=5000
+)
+
+# Socket.IO 애플리케이션 생성
+socket_app = socketio.ASGIApp(
+    sio,
+    socketio_path='socket.io'
+)
+
+# FastAPI에 Socket.IO 애플리케이션 마운트
+app.mount("/", socket_app)
+
+# 서버 실행
+if __name__ == "__main__":
+    uvicorn.run(
+        "server:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=True,
+        log_level="info"
+    )
+
 @sio.on('audio_stream_data')
 async def handle_audio_stream(sid, data):
     try:

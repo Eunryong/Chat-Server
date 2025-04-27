@@ -9,6 +9,21 @@ import base64
 import wave
 import io
 from datetime import datetime
+import librosa
+from fastapi import FastAPI
+from starlette.middleware.cors import CORSMiddleware
+
+# FastAPI 애플리케이션 생성
+app = FastAPI()
+
+# CORS 미들웨어 추가
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # React 개발 서버 주소
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 # 로깅 설정
 logging.basicConfig(
@@ -24,14 +39,31 @@ logger = logging.getLogger(__name__)
 # Socket.IO 서버 생성
 sio = socketio.AsyncServer(
     async_mode='asgi',
-    cors_allowed_origins=['http://localhost:3000'],
+    cors_allowed_origins=["http://localhost:3000"],  # React 개발 서버 주소
+    cors_credentials=False,
     logger=True,
     engineio_logger=True,
     ping_timeout=60,
     ping_interval=25,
     allow_upgrades=True,
-    transports=['websocket']
+    transports=['websocket', 'polling'],
+    max_http_buffer_size=1e8,
+    async_handlers=True,
+    always_connect=True,
+    reconnection=True,
+    reconnection_attempts=5,
+    reconnection_delay=1000,
+    reconnection_delay_max=5000
 )
+
+# WebRTC 설정
+ICE_SERVERS = [
+    {'urls': 'stun:stun.l.google.com:19302'},
+    {'urls': 'stun:stun1.l.google.com:19302'},
+    {'urls': 'stun:stun2.l.google.com:19302'},
+    {'urls': 'stun:stun3.l.google.com:19302'},
+    {'urls': 'stun:stun4.l.google.com:19302'},
+]
 
 # 연결 관리
 class ConnectionManager:
@@ -45,10 +77,16 @@ class ConnectionManager:
         self.audio_streams = {}  # 오디오 스트림 관리
         self.stream_buffers = {}  # 스트림 버퍼 관리
         self.stream_processors = {}  # 스트림 처리 태스크 관리
-        self.sample_rate = 16000  # 오디오 샘플링 레이트
-        self.buffer_duration = 1.0  # 버퍼 지속 시간 (초)
+        self.sample_rate = 16000  # STT 모델 샘플레이트
+        self.buffer_duration = 0.5  # 버퍼 지속 시간 (초)
         self.stt_files = {}  # STT 파일 처리 상태 관리
         self.processing_tasks = {}  # 처리 중인 태스크 관리
+        self.webrtc_sample_rate = 48000  # WebRTC 샘플레이트
+        self.max_buffer_size = 48000 * 3  # 최대 버퍼 크기 (3초)
+        self.min_buffer_duration = 0.1  # 최소 100ms
+        self.optimal_buffer_duration = 0.5  # 최적 500ms
+        self.max_buffer_duration = 1.0  # 최대 1초
+        self.ice_servers = ICE_SERVERS
 
     def set_reference_text(self, sid, text):
         self.reference_texts[sid] = text
@@ -68,11 +106,11 @@ class ConnectionManager:
             'total_samples': 0
         }
         
-        # 스트림 버퍼 초기화
-        buffer_size = int(self.sample_rate * self.buffer_duration)
+        # 스트림 버퍼 초기화 (WebRTC 샘플레이트 기준)
+        buffer_size = int(self.webrtc_sample_rate * self.buffer_duration)
         self.stream_buffers[sid][stream_id] = deque(maxlen=buffer_size)
         
-        logger.info(f"[오디오 스트림 추가] sid: {sid}, stream_id: {stream_id}")
+        logger.info(f"[오디오 스트림 추가] sid: {sid}, stream_id: {stream_id}, 버퍼 크기: {buffer_size}")
 
     def remove_audio_stream(self, sid, stream_id):
         """오디오 스트림 제거"""
@@ -93,38 +131,66 @@ class ConnectionManager:
         try:
             if sid not in self.stream_buffers or stream_id not in self.stream_buffers[sid]:
                 self.add_audio_stream(sid, stream_id)
-            
-            # 바이너리 데이터를 numpy 배열로 변환
+
+            # 1. 바이너리 데이터를 int16 numpy 배열로 변환
             audio_array = np.frombuffer(audio_data, dtype=np.int16)
-            logger.info(f"[오디오 청크] 수신 데이터 크기: {len(audio_array)}")
             
-            # float32로 변환 및 정규화
-            audio_array = audio_array.astype(np.float32) / 32768.0
-            logger.info(f"[오디오 정규화] 최소값: {audio_array.min()}, 최대값: {audio_array.max()}")
-            
-            # 오디오 데이터를 버퍼에 추가
+            # 0 데이터 체크
+            if np.all(audio_array == 0):
+                logger.warning("[오디오 데이터] 모든 샘플이 0입니다.")
+                return {"ready": False, "error": "오디오 데이터가 없습니다."}
+
+            # 2. Stereo인 경우 Mono로 다운믹싱
+            if audio_array.ndim == 2:
+                audio_array = audio_array.mean(axis=1).astype(np.int16)
+
+            # 3. float32로 정규화
+            max_abs = np.max(np.abs(audio_array))
+            if max_abs > 0:
+                audio_array = audio_array.astype(np.float32) / 32768.0
+            else:
+                logger.warning("[오디오 정규화] 최대 절대값이 0입니다.")
+                return {"ready": False, "error": "오디오 데이터가 없습니다."}
+
+            # 4. 오디오 데이터를 버퍼에 추가
             buffer = self.stream_buffers[sid][stream_id]
             buffer.extend(audio_array)
-            
-            # 버퍼가 충분히 쌓였는지 확인 (최소 1초)
-            if len(buffer) >= self.sample_rate:
-                # 처리할 데이터 추출
-                process_data = np.array(list(buffer), dtype=np.float32)
-                buffer.clear()  # 버퍼 비우기
+
+            # 5. 버퍼가 최대 크기를 초과하면 오래된 데이터 제거
+            if len(buffer) > self.max_buffer_size:
+                excess = len(buffer) - self.max_buffer_size
+                for _ in range(excess):
+                    buffer.popleft()
+
+            # 6. 버퍼가 충분히 쌓였는지 확인 (최소 0.1초)
+            min_required_samples = int(self.webrtc_sample_rate * 0.1)  # 100ms
+            optimal_required_samples = int(self.webrtc_sample_rate * 0.5)  # 500ms
+
+            if len(buffer) >= min_required_samples:
+                # 7. 처리할 데이터 크기 결정
+                process_size = min(len(buffer), optimal_required_samples)
+                process_data = np.array(list(buffer)[:process_size], dtype=np.float32)
                 
-                # 스트림 정보 업데이트
-                self.audio_streams[sid][stream_id]['total_samples'] += len(process_data)
-                
-                logger.info(f"[버퍼 처리] 처리 데이터 크기: {len(process_data)}")
-                return process_data
-                
-            logger.info(f"[버퍼 누적] 현재 버퍼 크기: {len(buffer)}")
-            return None
-            
+                # 8. 처리된 데이터만큼 버퍼에서 제거
+                for _ in range(process_size):
+                    buffer.popleft()
+
+                # 9. 48kHz → 16kHz 리샘플링
+                resampled_data = librosa.resample(process_data, orig_sr=self.webrtc_sample_rate, target_sr=self.sample_rate)
+                logger.info(f"[STT 처리] 데이터 크기: {len(resampled_data)}")
+
+                # 10. 스트림 통계 업데이트
+                self.audio_streams[sid][stream_id]['total_samples'] += len(resampled_data)
+
+                # 11. 추론 준비 완료 상태로 반환
+                return {"ready": True, "audio": resampled_data}
+
+            return {"ready": False}
+
         except Exception as e:
             logger.error(f"[오디오 청크 처리 오류] {str(e)}", exc_info=True)
-            return None
-
+            return {"ready": False, "error": str(e)}
+            
     def update_avatar_state(self, sid, state):
         self.avatar_states[sid] = state
         logger.info(f"아바타 상태 업데이트: {state}")
@@ -134,6 +200,12 @@ class ConnectionManager:
             self.peer_connections[sid] = set()
         self.peer_connections[sid].add(peer_id)
         logger.info(f"피어 연결 추가: {sid} -> {peer_id}")
+        
+        # ICE 서버 정보 전송
+        if socketRef.current:
+            socketRef.current.emit('ice_servers', {
+                'servers': self.ice_servers
+            }, room=sid)
 
     def remove_peer_connection(self, sid, peer_id):
         if sid in self.peer_connections:
@@ -144,23 +216,25 @@ class ConnectionManager:
         """오디오 스트림 처리"""
         try:
             # 오디오 데이터 처리
-            process_data = self.add_audio_chunk(sid, stream_id, audio_data)
-            if process_data is not None:
+            result = self.add_audio_chunk(sid, stream_id, audio_data)
+            
+            if result["ready"]:
                 # 참조 텍스트 확인
                 reference_text = self.reference_texts.get(sid)
                 if reference_text is None:
                     logger.warning(f"[참조 텍스트 없음] sid: {sid}")
                     return
                 
-                logger.info(f"[STT 처리 시작] 데이터 크기: {len(process_data)}")
+                logger.info(f"[STT 처리 시작] 데이터 크기: {len(result['audio'])}")
                 
                 # STT 처리
                 analysis_result = pronunciation_analyzer.analyze_pronunciation(
-                    process_data,
+                    result['audio'],
                     reference_text
                 )
                 
                 logger.info(f"[STT 결과] 전사: {analysis_result.get('transcription', '')}")
+                logger.info(f"[STT 결과] 유사도 점수: {analysis_result.get('similarity_score', 0.0)}")
                 
                 # 결과 전송
                 await sio.emit('stream_analysis_result', {
@@ -174,7 +248,7 @@ class ConnectionManager:
                     await sio.emit('stt-result', {
                         'text': analysis_result['transcription']
                     }, room=sid)
-                
+                    
         except Exception as e:
             logger.error(f"[오디오 스트림 처리 오류] {str(e)}", exc_info=True)
             await sio.emit('stream_error', {
@@ -215,6 +289,7 @@ class ConnectionManager:
                 
                 audio_array = np.frombuffer(audio_frames, dtype=dtype)
                 logger.info(f"[오디오 데이터 변환] 배열 크기: {audio_array.shape}, 데이터 타입: {dtype}")
+                logger.debug(f"[STT 디버그] 추출된 오디오 배열 샘플 일부: {audio_array[:10]}")
                 
                 # 모노로 변환 (필요한 경우)
                 if n_channels > 1:
@@ -224,6 +299,11 @@ class ConnectionManager:
                 # float32로 정규화
                 audio_array = audio_array.astype(np.float32) / np.iinfo(dtype).max
                 logger.info(f"[정규화] 최소값: {audio_array.min()}, 최대값: {audio_array.max()}")
+                
+                # STT 모델 샘플레이트(16kHz)로 리샘플링
+                if frame_rate != 16000:
+                    audio_array = librosa.resample(audio_array, orig_sr=frame_rate, target_sr=16000)
+                    logger.info(f"[리샘플링] {frame_rate}Hz → 16000Hz 변환 완료")
                 
                 # STT 처리
                 reference_text = self.reference_texts.get(sid)
@@ -251,8 +331,13 @@ class ConnectionManager:
                 await sio.emit('stt_file_result', {
                     'file_id': file_id,
                     'status': 'completed',
-                    'result': analysis_result,
-                    'processing_time': processing_time
+                    'result': {
+                        'transcription': analysis_result.get('transcription', ''),
+                        'similarity_score': analysis_result.get('similarity_score', 0.0),
+                        'overall_score': analysis_result.get('overall_score', 0.0),
+                        'phoneme_analysis': analysis_result.get('phoneme_analysis', []),
+                        'processing_time': processing_time
+                    }
                 }, room=sid)
                 
         except Exception as e:
@@ -270,10 +355,18 @@ async def connect(sid, environ):
     """클라이언트 연결"""
     try:
         logger.info(f"새로운 클라이언트 연결: {sid}")
+        logger.info(f"연결 환경: {environ}")
+        
+        # 연결 응답 전송
         await sio.emit('connect_response', {
             'status': 'connected',
-            'message': '연결이 성공적으로 설정되었습니다'
+            'message': '연결이 성공적으로 설정되었습니다',
+            'sid': sid
         }, room=sid)
+        
+        # 연결 상태 로깅
+        logger.info(f"클라이언트 {sid} 연결 완료")
+        
     except Exception as e:
         logger.error(f"[연결 설정 오류] {str(e)}", exc_info=True)
         await sio.emit('error', {'message': str(e)}, room=sid)
@@ -295,6 +388,8 @@ async def disconnect(sid):
             for task in manager.processing_tasks[sid].values():
                 task.cancel()
             del manager.processing_tasks[sid]
+            
+        logger.info(f"클라이언트 {sid} 연결 종료 처리 완료")
             
     except Exception as e:
         logger.error(f"[연결 종료 처리 오류] {str(e)}", exc_info=True)
@@ -419,11 +514,21 @@ async def avatarState(sid, data):
 async def offer(sid, data):
     try:
         logger.info(f"Offer 수신 from {sid}: {data}")
-        await sio.emit('offer', {
-            'from': sid,
-            'offer': data
-        }, skip_sid=sid)
-        logger.info(f"Offer 전달 완료 from {sid}")
+        target_sid = data.get('target')
+        if target_sid:
+            await sio.emit('offer', {
+                'from': sid,
+                'offer': data.get('offer'),
+                'ice_servers': ICE_SERVERS
+            }, room=target_sid)
+            logger.info(f"Offer 전달 완료 from {sid} to {target_sid}")
+        else:
+            await sio.emit('offer', {
+                'from': sid,
+                'offer': data.get('offer'),
+                'ice_servers': ICE_SERVERS
+            }, skip_sid=sid)
+            logger.info(f"Offer 전달 완료 from {sid}")
     except Exception as e:
         logger.error(f"Offer 전달 중 오류: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
@@ -432,11 +537,19 @@ async def offer(sid, data):
 async def answer(sid, data):
     try:
         logger.info(f"Answer 수신 from {sid}: {data}")
-        await sio.emit('answer', {
-            'from': sid,
-            'answer': data
-        }, skip_sid=sid)
-        logger.info(f"Answer 전달 완료 from {sid}")
+        target_sid = data.get('target')
+        if target_sid:
+            await sio.emit('answer', {
+                'from': sid,
+                'answer': data.get('answer')
+            }, room=target_sid)
+            logger.info(f"Answer 전달 완료 from {sid} to {target_sid}")
+        else:
+            await sio.emit('answer', {
+                'from': sid,
+                'answer': data.get('answer')
+            }, skip_sid=sid)
+            logger.info(f"Answer 전달 완료 from {sid}")
     except Exception as e:
         logger.error(f"Answer 전달 중 오류: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
@@ -445,11 +558,19 @@ async def answer(sid, data):
 async def ice_candidate(sid, data):
     try:
         logger.info(f"ICE 후보 수신 from {sid}: {data}")
-        await sio.emit('ice-candidate', {
-            'from': sid,
-            'candidate': data
-        }, skip_sid=sid)
-        logger.info(f"ICE 후보 전달 완료 from {sid}")
+        target_sid = data.get('target')
+        if target_sid:
+            await sio.emit('ice-candidate', {
+                'from': sid,
+                'candidate': data.get('candidate')
+            }, room=target_sid)
+            logger.info(f"ICE 후보 전달 완료 from {sid} to {target_sid}")
+        else:
+            await sio.emit('ice-candidate', {
+                'from': sid,
+                'candidate': data.get('candidate')
+            }, skip_sid=sid)
+            logger.info(f"ICE 후보 전달 완료 from {sid}")
     except Exception as e:
         logger.error(f"ICE 후보 전달 중 오류: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
@@ -553,4 +674,10 @@ async def stt_file_cancel(sid, data):
         await sio.emit('error', {'message': str(e)}, room=sid)
 
 # Socket.IO 애플리케이션 생성
-socket_app = socketio.ASGIApp(sio) 
+socket_app = socketio.ASGIApp(
+    sio,
+    socketio_path='socket.io'
+)
+
+# FastAPI에 Socket.IO 애플리케이션 마운트
+app.mount("/", socket_app) 

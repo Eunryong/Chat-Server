@@ -27,14 +27,43 @@ class PhonemeAnalysis:
 
 class PronunciationAnalyzer:
     def __init__(self):
-        # 한국어 음성 인식을 위한 모델 로드
         self.model_name = "kresnik/wav2vec2-large-xlsr-korean"
-        self.processor = Wav2Vec2Processor.from_pretrained(self.model_name)
-        self.model = Wav2Vec2ForCTC.from_pretrained(self.model_name)
+        logger.info(f"[모델 초기화] {self.model_name} 모델 로드 시작")
         
-        # CPU 사용
-        self.device = torch.device("cpu")
-        self.model.to(self.device)
+        try:
+            # 프로세서 초기화
+            self.processor = Wav2Vec2Processor.from_pretrained(
+                self.model_name,
+                cache_dir="./model_cache"
+            )
+            
+            # 모델 초기화
+            self.model = Wav2Vec2ForCTC.from_pretrained(
+                self.model_name,
+                cache_dir="./model_cache",
+                output_hidden_states=True,
+                return_dict=True,
+                ignore_mismatched_sizes=True,  # 가중치 불일치 무시
+                local_files_only=False,  # 로컬 파일이 없으면 다운로드
+                num_labels=len(self.processor.tokenizer)  # 토크나이저 크기에 맞게 레이블 수 설정
+            )
+            
+            # 모델을 평가 모드로 설정
+            self.model.eval()
+            
+            # CPU 사용
+            self.device = torch.device("cpu")
+            self.model.to(self.device)
+            
+            # 모델 설정 확인
+            logger.info(f"[모델 설정] 토크나이저 크기: {len(self.processor.tokenizer)}")
+            logger.info(f"[모델 설정] 모델 출력 크기: {self.model.config.vocab_size}")
+            
+            logger.info(f"[모델 초기화] {self.model_name} 모델 로드 완료")
+            
+        except Exception as e:
+            logger.error(f"[모델 초기화 오류] {str(e)}", exc_info=True)
+            raise
         
         # 오디오 전처리 설정
         self.sample_rate = 16000
@@ -66,85 +95,109 @@ class PronunciationAnalyzer:
             'ㅋ': {'strength': 0.8, 'duration': 0.12},
             # ... 다른 음소에 대한 규칙 추가
         }
+        
+        logger.info("[모델 초기화 완료]")
     
     def preprocess_audio(self, audio_data: np.ndarray) -> np.ndarray:
         """오디오 데이터 전처리"""
         try:
             logger.info(f"전처리 전 오디오 데이터: 최소={np.min(audio_data)}, 최대={np.max(audio_data)}")
             
-            # 볼륨 정규화
-            max_volume = np.max(np.abs(audio_data))
-            if max_volume > 0:
-                audio_data = audio_data / max_volume
+            # 0 데이터 체크
+            if np.all(audio_data == 0):
+                logger.warning("입력 오디오 데이터가 모두 0입니다.")
+                return audio_data
             
-            # 노이즈 제거
+            # 1. 볼륨 정규화
+            max_abs = np.max(np.abs(audio_data))
+            if max_abs > 0:
+                audio_data = audio_data / max_abs
+            else:
+                logger.warning("오디오 데이터의 최대 절대값이 0입니다.")
+            
+            # 2. 노이즈 제거 (간단한 필터링)
             audio_data = librosa.effects.preemphasis(audio_data)
             
-            # 샘플링 레이트 확인 및 조정
-            if len(audio_data) < self.sample_rate:
-                # 데이터가 너무 짧으면 패딩 추가
-                padding = np.zeros(self.sample_rate - len(audio_data))
+            # 3. 짧은 오디오 데이터 패딩
+            if len(audio_data) < 16000:  # 1초 미만
+                padding = np.zeros(16000 - len(audio_data))
                 audio_data = np.concatenate([audio_data, padding])
-            elif len(audio_data) > self.sample_rate * 30:  # 30초 이상이면 잘라냄
-                audio_data = audio_data[:self.sample_rate * 30]
+            
+            # 4. NaN 체크 및 처리
+            if np.isnan(audio_data).any():
+                logger.warning("NaN 값이 발견되어 0으로 대체합니다.")
+                audio_data = np.nan_to_num(audio_data)
             
             logger.info(f"전처리 후 오디오 데이터: 최소={np.min(audio_data)}, 최대={np.max(audio_data)}")
             return audio_data
             
         except Exception as e:
-            logger.error(f"[오디오 전처리 오류] {str(e)}")
-            return audio_data
+            logger.error(f"[오디오 전처리 오류] {str(e)}", exc_info=True)
+            raise
 
     def analyze_pronunciation(self, audio_data: np.ndarray, reference_text: str) -> Dict[str, Any]:
         """오디오 데이터의 발음을 분석하여 정확도를 평가"""
         try:
-            logger.info(f"입력 오디오 데이터 크기: {len(audio_data)}")
+            # 1. 오디오 전처리
+            processed_audio = self.preprocess_audio(audio_data)
             
-            # 오디오 전처리
-            audio_data = self.preprocess_audio(audio_data)
-            logger.info(f"전처리 후 오디오 데이터 크기: {len(audio_data)}")
-            
-            # 음성 인식
-            input_values = self.processor(
-                audio_data, 
-                sampling_rate=self.sample_rate,
+            # 2. 모델 입력 준비
+            inputs = self.processor(
+                processed_audio, 
+                sampling_rate=self.sample_rate, 
                 return_tensors="pt",
                 padding=True
-            ).input_values
+            )
             
-            logger.info(f"모델 입력 텐서 크기: {input_values.shape}")
-            
-            input_values = input_values.to(self.device)
-            
+            # 3. STT 추론
             with torch.no_grad():
-                logits = self.model(input_values).logits
-                logger.info(f"모델 출력 로짓 크기: {logits.shape}")
+                outputs = self.model(**inputs)
+                logits = outputs.logits
                 
+                # 빔 서치를 사용하여 더 정확한 전사 생성
                 predicted_ids = torch.argmax(logits, dim=-1)
-                logger.info(f"예측된 ID: {predicted_ids}")
+                transcription = self.processor.batch_decode(
+                    predicted_ids,
+                    skip_special_tokens=True,
+                    clean_up_tokenization_spaces=True,
+                    group_tokens=True
+                )
                 
-                transcription = self.processor.batch_decode(predicted_ids)[0]
-                logger.info(f"인식된 텍스트: {transcription}")
+                # 신뢰도 점수 계산
+                probs = torch.softmax(logits, dim=-1)
+                confidence_scores = torch.max(probs, dim=-1).values
+                avg_confidence = torch.mean(confidence_scores).item()
             
-            # 음소 단위로 분리
+            # 4. 결과 처리
+            result = {
+                'transcription': transcription[0].strip() if transcription else "",
+                'confidence_score': float(avg_confidence),
+                'overall_score': float(torch.mean(probs).item())
+            }
+            
+            logger.info(f"[STT 결과] 전사: {result['transcription']}")
+            logger.info(f"[STT 결과] 신뢰도: {result['confidence_score']:.3f}")
+            
+            # 참조 텍스트와 비교
             reference_jamo = self._text_to_jamo(reference_text)
-            transcription_jamo = self._text_to_jamo(transcription)
+            transcription_jamo = self._text_to_jamo(result['transcription'])
             
             # 음소별 상세 분석
-            phoneme_analysis = self._analyze_phonemes(audio_data, reference_jamo, transcription_jamo)
+            phoneme_analysis = self._analyze_phonemes(processed_audio, reference_jamo, transcription_jamo)
             
             # 발음 유사도 계산
             similarity_score = self._calculate_similarity(reference_jamo, transcription_jamo)
             
             # 음절 강세 분석
-            stress_score = self._analyze_stress(audio_data)
+            stress_score = self._analyze_stress(processed_audio)
             
             return {
                 "overall_score": (similarity_score + stress_score) / 2,
                 "similarity_score": similarity_score,
                 "stress_score": stress_score,
-                "transcription": transcription,
+                "transcription": result['transcription'],
                 "reference": reference_text,
+                "confidence_score": result['confidence_score'],
                 "phoneme_analysis": [{
                     "phoneme": p.phoneme,
                     "type": p.type.value,
@@ -155,12 +208,8 @@ class PronunciationAnalyzer:
             }
             
         except Exception as e:
-            logger.error(f"[발음 분석 오류] {str(e)}")
-            return {
-                "error": str(e),
-                "overall_score": 0.0,
-                "transcription": ""
-            }
+            logger.error(f"[발음 분석 오류] {str(e)}", exc_info=True)
+            raise
     
     def _text_to_jamo(self, text: str) -> List[str]:
         """한글 텍스트를 음소(자모) 단위로 분리"""

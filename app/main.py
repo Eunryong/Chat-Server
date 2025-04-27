@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.v1 import audio
-from app.api.v1.websocket import socket_app  # socketio.ASGIApp(sio)
+from app.api.v1.websocket import app as websocket_app
 
 app = FastAPI(
     title="AI 아바타 스피치 학습 코치 시스템",
@@ -12,8 +12,8 @@ app = FastAPI(
 # CORS 미들웨어
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
-    allow_credentials=True,
+    allow_origins=["http://localhost:3000"],  # React 개발 서버 주소
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"]
 )
@@ -22,7 +22,7 @@ app.add_middleware(
 app.include_router(audio.router, prefix="/api/v1/audio", tags=["audio"])
 
 # Socket.IO 애플리케이션 등록
-app.mount("/ws", socket_app)
+app.mount("/", websocket_app)
 
 @app.get("/")
 async def root():
